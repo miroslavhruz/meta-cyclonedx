@@ -46,14 +46,10 @@ python () {
             bb.warn("CVE_STATUS_GROUPS contains undefined variable %s" % cve_status_group)
 }
 
-# Clean out work folder to avoid leftovers from previous builds when including build-time package
-# information and a recipe was removed from the dependency list. (CYCLONEDX_RUNTIME_PACKAGES_ONLY set to 0)
-python clean_cyclonedx_work_folder() {
-    bb.note(f"Cleaning cyclonedx work folder {d.getVar('CYCLONEDX_WORK_DIR_ROOT')}")
-}
-clean_cyclonedx_work_folder[cleandirs] = "${CYCLONEDX_WORK_DIR_ROOT}"
-addhandler clean_cyclonedx_work_folder
-clean_cyclonedx_work_folder[eventmask] = "bb.event.BuildStarted"
+# Note: We don't clean the entire CYCLONEDX_WORK_DIR_ROOT on BuildStarted anymore
+# as it interferes with sstate restoration. Each recipe's work dir is managed
+# by the sstate mechanism through do_populate_cyclonedx[cleandirs] = "${CYCLONEDX_WORK_DIR}"
+# which cleans only when the task actually runs, not when restored from sstate.
 
 python do_cyclonedx_package_collect() {
     """
@@ -77,7 +73,7 @@ python do_cyclonedx_package_collect() {
     pn_list["pkgs"] = []
     cves = []
     # append all defined package names for recipe to pn_list pkgs
-    for pkg in generate_packages_list(name, version):
+    for pkg in generate_packages_list(d, name, version):
         if not next((c for c in pn_list["pkgs"] if c["cpe"] == pkg["cpe"]), None):
             pn_list["pkgs"].append(pkg)
             bom_ref = pkg["bom-ref"]
@@ -122,6 +118,8 @@ python do_cyclonedx_package_collect() {
 
 addtask do_cyclonedx_package_collect before do_build
 do_cyclonedx_package_collect[cleandirs] = "${CYCLONEDX_TMP_WORK_DIR}"
+# Force task to run when bbclass changes
+do_cyclonedx_package_collect[vardeps] += "generate_packages_list append_to_vex get_recipe_dependencies"
 
 # Utilizing shared state for output caching
 # see https://docs.yoctoproject.org/overview-manual/concepts.html#shared-state
@@ -196,11 +194,65 @@ def resolve_dependency_ref(depends, bom_ref_map, alias_map):
     # Return None if no solution found
     return None
 
-def generate_packages_list(products_names, version):
+def generate_packages_list(d, products_names, version):
     """
     Get a list of products and generate CPE and PURL identifiers for each of them.
     """
     import uuid
+    import re
+
+    # Extract license information from recipe
+    license = d.getVar("LICENSE") or ""
+
+    # Map non-SPDX Yocto licenses to SPDX equivalents
+    license_map = {
+        "CLOSED": "NOASSERTION",
+        "PD": "CC0-1.0",  # Public Domain mapped to CC0
+        "Proprietary": "Proprietary",  # Will use name field
+    }
+
+    # Convert Yocto license format to CycloneDX format
+    licenses_list = None
+    if license:
+        # Clean up the license string
+        license_clean = license.strip()
+
+        # Map known non-SPDX licenses
+        for old, new in license_map.items():
+            license_clean = license_clean.replace(old, new)
+
+        # Process the license
+        if license_clean:
+            # Check if it's a complex expression (contains & or |)
+            if re.search(r'[&|()]', license_clean):
+                # Use expression field for complex licenses
+                # Clean up extra spaces
+                license_expr = re.sub(r'\s+', ' ', license_clean).strip()
+                licenses_list = [{"expression": license_expr}]
+            else:
+                # Simple single license
+                # Check if it's a LicenseRef, NOASSERTION, or non-SPDX license - use name field
+                # Common non-standard licenses that should use name instead of id:
+                # - Licenses with exceptions (e.g., "GPL-2.0-with-OpenSSL-exception")
+                # - Custom/vendor licenses (e.g., "BitstreamVera")
+                # - LicenseRef- prefixed licenses
+                non_standard_markers = [
+                    "LicenseRef-",
+                    "Proprietary",
+                    "NOASSERTION",
+                    "-with-",  # License exceptions
+                    "BitstreamVera",
+                    "Commercial",
+                    "Evaluation",
+                ]
+
+                is_non_standard = any(marker in license_clean for marker in non_standard_markers)
+
+                if is_non_standard:
+                    licenses_list = [{"license": {"name": license_clean}}]
+                else:
+                    # Standard SPDX license - use id field
+                    licenses_list = [{"license": {"id": license_clean}}]
 
     packages = []
 
@@ -223,10 +275,12 @@ def generate_packages_list(products_names, version):
             "type": "library",
             "cpe": 'cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*'.format(vendor or "*", product, version),
             "purl": 'pkg:generic/{}{}@{}'.format(f"{vendor}/" if vendor else '', product, version),
-            "bom-ref": str(uuid.uuid4())
+            "bom-ref": str(uuid.uuid4()),
         }
         if vendor != "":
             pkg["group"] = vendor
+        if licenses_list:
+            pkg["licenses"] = licenses_list
         packages.append(pkg)
     return packages
 
@@ -403,8 +457,17 @@ python do_deploy_cyclonedx() {
 
     d.setVar("PN", save_pn)
 
-    write_json(d.getVar("CYCLONEDX_EXPORT_SBOM"), sbom)
-    write_json(d.getVar("CYCLONEDX_EXPORT_VEX"), vex)
+    export_sbom_path = d.getVar("CYCLONEDX_EXPORT_SBOM")
+    export_vex_path = d.getVar("CYCLONEDX_EXPORT_VEX")
+    bb.note(f"Writing SBOM to: {export_sbom_path}")
+    bb.note(f"Writing VEX to: {export_vex_path}")
+
+    # Ensure the directory exists
+    import os
+    os.makedirs(os.path.dirname(export_sbom_path), exist_ok=True)
+
+    write_json(export_sbom_path, sbom)
+    write_json(export_vex_path, vex)
 }
 do_deploy_cyclonedx[cleandirs] = "${CYCLONEDX_EXPORT_DIR}"
 
