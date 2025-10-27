@@ -136,7 +136,7 @@ do_populate_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_TMP_WORK_DIR}"
 do_populate_cyclonedx[sstate-outputdirs] = "${CYCLONEDX_WORK_DIR}"
 addtask do_populate_cyclonedx_setscene
 addtask do_populate_cyclonedx after do_cyclonedx_package_collect
-do_rootfs[recrdeptask] += "do_populate_cyclonedx"
+# Note: do_rootfs[recrdeptask] is set in __anonymous() for image recipes only
 
 def read_json(path):
     import json
@@ -324,7 +324,13 @@ def append_to_vex(d, cve, cves, bom_ref):
 python do_deploy_cyclonedx() {
     """
     Select CVE and package information and runtime packages and output them into a single export file.
+    Only runs for image recipes.
     """
+    # This task should only run for image recipes
+    if not bb.data.inherits_class('image', d):
+        bb.note("Skipping do_deploy_cyclonedx for non-image recipe")
+        return
+
     from oe.rootfs import image_list_installed_packages
     import uuid
     from datetime import datetime, timezone
@@ -374,15 +380,74 @@ python do_deploy_cyclonedx() {
 
     recipes = set()
     if d.getVar('CYCLONEDX_RUNTIME_PACKAGES_ONLY') == "1":
-        for pkg in list(image_list_installed_packages(d)):
-            pkg_info = os.path.join(d.getVar('PKGDATA_DIR'),
-                                    'runtime-reverse', pkg)
-            pkg_data = oe.packagedata.read_pkgdatafile(pkg_info)
-            recipes.add(pkg_data["PN"])
+        # Use IMAGE_MANIFEST instead of image_list_installed_packages to avoid dnf query issues
+        manifest_file = d.getVar('IMAGE_MANIFEST')
+        bb.note(f"IMAGE_MANIFEST from d.getVar: {manifest_file}")
+
+        # If IMAGE_MANIFEST is not set or doesn't exist, try to find it
+        if not manifest_file or not os.path.exists(manifest_file):
+            # Try to construct the path manually
+            deploy_dir_image = d.getVar('IMGDEPLOYDIR')
+            image_link_name = d.getVar('IMAGE_LINK_NAME')
+            bb.note(f"IMGDEPLOYDIR: {deploy_dir_image}, IMAGE_LINK_NAME: {image_link_name}")
+            if deploy_dir_image and image_link_name:
+                manifest_file = os.path.join(deploy_dir_image, f"{image_link_name}.manifest")
+                bb.note(f"Trying constructed path: {manifest_file}, exists: {os.path.exists(manifest_file)}")
+
+            # Try alternate location in deploy-complete
+            if not manifest_file or not os.path.exists(manifest_file):
+                workdir = d.getVar('WORKDIR')
+                image_name = d.getVar('IMAGE_NAME')
+                if workdir and image_name:
+                    # Try deploy-image-complete directory
+                    alt_path = os.path.join(workdir, f"deploy-{d.getVar('PN')}-image-complete", f"{image_name}.manifest")
+                    bb.note(f"Trying alternate path: {alt_path}, exists: {os.path.exists(alt_path)}")
+                    if os.path.exists(alt_path):
+                        manifest_file = alt_path
+
+        bb.note(f"CYCLONEDX_WORK_DIR_ROOT: {cyclonedx_work_dir_root}")
+        if manifest_file and os.path.exists(manifest_file):
+            bb.note(f"Reading package list from manifest: {manifest_file}")
+            with open(manifest_file, 'r') as f:
+                for line in f:
+                    # Manifest format: package_name package_arch package_version
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    pkg = parts[0]
+                    pkg_info = os.path.join(d.getVar('PKGDATA_DIR'),
+                                            'runtime-reverse', pkg)
+                    if os.path.exists(pkg_info):
+                        pkg_data = oe.packagedata.read_pkgdatafile(pkg_info)
+                        recipes.add(pkg_data["PN"])
+                    else:
+                        bb.warn(f"Package info not found for {pkg} at {pkg_info}")
+            bb.note(f"Found {len(recipes)} recipes from manifest")
+        else:
+            # Fallback to image_list_installed_packages if manifest not available
+            bb.warn("IMAGE_MANIFEST not found, falling back to image_list_installed_packages")
+            for pkg in list(image_list_installed_packages(d)):
+                pkg_info = os.path.join(d.getVar('PKGDATA_DIR'),
+                                        'runtime-reverse', pkg)
+                pkg_data = oe.packagedata.read_pkgdatafile(pkg_info)
+                recipes.add(pkg_data["PN"])
     else:
         recipes = {pn for pn in os.listdir(cyclonedx_work_dir_root) if os.path.isdir(os.path.join(cyclonedx_work_dir_root, pn))}
 
-    save_pn = d.getVar("PN")
+    bb.note(f"Total recipes to process: {len(recipes)}")
+
+    # Check which recipes have cyclonedx data available
+    # Use CYCLONEDX_WORK_DIR_ROOT directly to avoid changing PN
+    recipes_with_data = []
+    for recipe in recipes:
+        pn_list_filepath = os.path.join(cyclonedx_work_dir_root, recipe, "pn-list.json")
+        if os.path.exists(pn_list_filepath):
+            recipes_with_data.append(recipe)
+
+    bb.note(f"Recipes with cyclonedx data: {len(recipes_with_data)} out of {len(recipes)}")
+    if len(recipes_with_data) < len(recipes):
+        missing = recipes - set(recipes_with_data)
+        bb.warn(f"Missing cyclonedx data for {len(missing)} recipes. Examples: {list(missing)[:10]}")
 
     # Create a bom_ref_map for dependencies sanitarization
     # And an alias_map to retrieve real pkg name
@@ -391,11 +456,7 @@ python do_deploy_cyclonedx() {
 
     # first loop to fill the dictionary
     for pkg in recipes:
-        # To be able to use the CYCLONEDX_WORK_DIR_PN_LIST variable we have to evaluate
-        # it with the different PN names set each time.
-        d.setVar("PN", pkg)
-
-        pn_list_filepath = d.getVar("CYCLONEDX_WORK_DIR_PN_LIST")
+        pn_list_filepath = os.path.join(cyclonedx_work_dir_root, pkg, "pn-list.json")
 
         if not os.path.exists(pn_list_filepath):
             continue
@@ -403,14 +464,10 @@ python do_deploy_cyclonedx() {
         pn_list = read_json(pn_list_filepath)
         for pn_pkg in pn_list["pkgs"]:
             bom_ref_map[pn_pkg["name"]]=pn_pkg
-            alias_map[d.getVar("PN")]=pn_pkg["name"]
+            alias_map[pkg]=pn_pkg["name"]
 
     for pkg in recipes:
-        # To be able to use the CYCLONEDX_WORK_DIR_PN_LIST variable we have to evaluate
-        # it with the different PN names set each time.
-        d.setVar("PN", pkg)
-
-        pn_list_filepath = d.getVar("CYCLONEDX_WORK_DIR_PN_LIST")
+        pn_list_filepath = os.path.join(cyclonedx_work_dir_root, pkg, "pn-list.json")
 
         if not os.path.exists(pn_list_filepath):
             continue
@@ -455,8 +512,6 @@ python do_deploy_cyclonedx() {
 
             write_json(pn_list_filepath, pn_list)
 
-    d.setVar("PN", save_pn)
-
     export_sbom_path = d.getVar("CYCLONEDX_EXPORT_SBOM")
     export_vex_path = d.getVar("CYCLONEDX_EXPORT_VEX")
     bb.note(f"Writing SBOM to: {export_sbom_path}")
@@ -469,9 +524,17 @@ python do_deploy_cyclonedx() {
     write_json(export_sbom_path, sbom)
     write_json(export_vex_path, vex)
 }
-do_deploy_cyclonedx[cleandirs] = "${CYCLONEDX_EXPORT_DIR}"
 
-# We use ROOTFS_POSTUNINSTALL_COMMAND to make sure this function runs exactly once
-# after the build process has been completed
-# see https://docs.yoctoproject.org/ref-manual/variables.html#term-ROOTFS_POSTUNINSTALL_COMMAND
-ROOTFS_POSTUNINSTALL_COMMAND =+ "do_deploy_cyclonedx; "
+# For image recipes, add do_deploy_cyclonedx as a proper task to ensure sstate dependencies work
+python __anonymous() {
+    import bb
+    # Check if this is an image recipe
+    if bb.data.inherits_class('image', d):
+        # Add as a proper task for images, runs after do_rootfs to access IMAGE_MANIFEST
+        bb.build.addtask('do_deploy_cyclonedx', 'do_build', 'do_rootfs', d)
+        # This task depends on having all recipe data available from do_populate_cyclonedx
+        d.setVarFlag('do_deploy_cyclonedx', 'recrdeptask', 'do_populate_cyclonedx')
+        d.setVarFlag('do_deploy_cyclonedx', 'cleandirs', d.getVar('CYCLONEDX_EXPORT_DIR'))
+        # Force do_rootfs to wait for do_populate_cyclonedx from all runtime dependencies
+        d.appendVarFlag('do_rootfs', 'recrdeptask', ' do_populate_cyclonedx')
+}
