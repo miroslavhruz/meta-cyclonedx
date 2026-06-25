@@ -512,6 +512,28 @@ python do_deploy_cyclonedx() {
 
             write_json(pn_list_filepath, pn_list)
 
+    # nnounce: fold in per-recipe pre-resolved CycloneDX fragments (e.g. Rust crate
+    # trees injected by cyclonedx-cargo.bbclass under cargo_components /
+    # cargo_dependencies). They carry their own bom-refs/purls and dependency edges,
+    # so append them verbatim instead of running them through the CPE-dedup and
+    # recipe-name dependency remap used for Yocto packages above.
+    seen_refs = {c.get("bom-ref") for c in sbom["components"] if c.get("bom-ref")}
+    for pkg in recipes:
+        pn_list_filepath = os.path.join(cyclonedx_work_dir_root, pkg, "pn-list.json")
+        if not os.path.exists(pn_list_filepath):
+            continue
+        extra = read_json(pn_list_filepath)
+        for comp in extra.get("cargo_components", []):
+            ref = comp.get("bom-ref") or comp.get("purl")
+            if ref and ref in seen_refs:
+                continue
+            if ref:
+                seen_refs.add(ref)
+            sbom["components"].append(comp)
+        for dep in extra.get("cargo_dependencies", []):
+            if dep not in sbom["dependencies"]:
+                sbom["dependencies"].append(dep)
+
     export_sbom_path = d.getVar("CYCLONEDX_EXPORT_SBOM")
     export_vex_path = d.getVar("CYCLONEDX_EXPORT_VEX")
     bb.note(f"Writing SBOM to: {export_sbom_path}")
