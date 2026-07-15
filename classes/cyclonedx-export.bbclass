@@ -44,6 +44,19 @@ python () {
                 d.setVarFlag("CVE_STATUS", cve, d.getVarFlag(cve_status_group, "status"))
         else:
             bb.warn("CVE_STATUS_GROUPS contains undefined variable %s" % cve_status_group)
+
+    # do_cyclonedx_package_collect reads the recipe's CVE_STATUS only through
+    # get_patched_cves() (an external oe.cve_check function), so bitbake's signature
+    # parser never sees CVE_STATUS and the task is NOT rebuilt when a status changes.
+    # With a shared sstate cache that means adding a CVE_STATUS (e.g. in the
+    # meta-nnounce-cve layer) is silently ignored -- the stale cached VEX is restored
+    # and the CVE never reaches the VEX. Fold the resolved CVE_STATUS flags (computed
+    # AFTER the groups above) into a signature variable that the task DOES depend on,
+    # so any status change invalidates the cache and regenerates the VEX.
+    _cve_status_flags = d.getVarFlags("CVE_STATUS") or {}
+    d.setVar("CYCLONEDX_CVE_STATUS_SIG",
+             ";".join("%s=%s" % (k, _cve_status_flags[k])
+                      for k in sorted(_cve_status_flags) if not k.startswith("_")))
 }
 
 # Note: We don't clean the entire CYCLONEDX_WORK_DIR_ROOT on BuildStarted anymore
@@ -119,7 +132,10 @@ python do_cyclonedx_package_collect() {
 addtask do_cyclonedx_package_collect before do_build
 do_cyclonedx_package_collect[cleandirs] = "${CYCLONEDX_TMP_WORK_DIR}"
 # Force task to run when bbclass changes
-do_cyclonedx_package_collect[vardeps] += "generate_packages_list append_to_vex get_recipe_dependencies"
+# CYCLONEDX_CVE_STATUS_SIG: rebuild when any CVE_STATUS changes (see anon python above).
+# SRC_URI: rebuild when a CVE-*.patch is added/removed (get_patched_cves derives the
+# "Patched" set from patch filenames in SRC_URI, which the task body doesn't reference).
+do_cyclonedx_package_collect[vardeps] += "generate_packages_list append_to_vex get_recipe_dependencies CYCLONEDX_CVE_STATUS_SIG SRC_URI"
 
 # Utilizing shared state for output caching
 # see https://docs.yoctoproject.org/overview-manual/concepts.html#shared-state
