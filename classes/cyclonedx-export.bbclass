@@ -45,6 +45,14 @@ python () {
         else:
             bb.warn("CVE_STATUS_GROUPS contains undefined variable %s" % cve_status_group)
 
+    # nnounce: register threat-model CVE_STATUS keywords so oe.cve_check maps them to
+    # "Ignored" instead of warning and defaulting to "Unpatched". append_to_vex renders
+    # these as not_affected + CycloneDX justification "protected_at_perimeter" (the CVE
+    # is real but unreachable across the device's access perimeter). Setting these flags
+    # is additive -- it does not disturb the standard poky CVE_CHECK_STATUSMAP entries.
+    for _tm_kw in ("requires-authentication", "requires-local-access", "requires-physical-access"):
+        d.setVarFlag("CVE_CHECK_STATUSMAP", _tm_kw, "Ignored")
+
     # do_cyclonedx_package_collect reads the recipe's CVE_STATUS only through
     # get_patched_cves() (an external oe.cve_check function), so bitbake's signature
     # parser never sees CVE_STATUS and the task is NOT rebuilt when a status changes.
@@ -307,9 +315,30 @@ def append_to_vex(d, cve, cves, bom_ref):
     """
     cve_id, abbrev_status, status, justification = cve
 
+    # nnounce threat-model categories (see THREATMODEL_JUSTIFICATION below): the CVE is
+    # real, but the attacker cannot cross the device's access perimeter -- it needs an
+    # already-authenticated user, or local, or physical access. On a sealed appliance
+    # these cross no trust boundary, so we render them "not_affected" with a machine-
+    # readable CycloneDX justification of "protected_at_perimeter" -> Dependency-Track
+    # hides them. The specific precondition stays in the detail (STATE:/JUSTIFICATION:)
+    # and in the CVE_STATUS description, so the disposition remains auditable/reversible.
+    # https://cyclonedx.org/docs/1.4/json/#vulnerabilities_items_analysis_justification
+    THREATMODEL_JUSTIFICATION = {
+        "requires-authentication": "protected_at_perimeter",
+        "requires-local-access": "protected_at_perimeter",
+        "requires-physical-access": "protected_at_perimeter",
+    }
+
+    cdx_justification = None
     # Currently, only "Patched" and "Ignored" status are relevant to us.
     # See https://docs.yoctoproject.org/singleindex.html#term-CVE_CHECK_STATUSMAP for possible statuses.
-    if abbrev_status == "Patched":
+    if status.strip() in THREATMODEL_JUSTIFICATION:
+        # Keyed on the CVE_STATUS keyword directly, so it works even if the keyword is
+        # not in CVE_CHECK_STATUSMAP (abbrev_status would otherwise be "Unpatched").
+        bb.debug(2, f"Found threat-model status '{status}' for {cve_id} in {d.getVar('BPN')}")
+        vex_state = "not_affected"
+        cdx_justification = THREATMODEL_JUSTIFICATION[status.strip()]
+    elif abbrev_status == "Patched":
         bb.debug(2, f"Found patch for {cve_id} in {d.getVar('BPN')}")
         vex_state = "resolved"
     elif abbrev_status == "Ignored":
@@ -324,15 +353,22 @@ def append_to_vex(d, cve, cves, bom_ref):
     if justification:
         detail_string += f"JUSTIFICATION: {justification}\n"
 
+    analysis = {
+        "state": vex_state,
+        "detail": detail_string,
+    }
+    # CycloneDX requires a justification for the not_affected state to be actionable;
+    # only our threat-model statuses set one (the Yocto Ignored statuses carry their
+    # reasoning in the detail string only, as before).
+    if cdx_justification:
+        analysis["justification"] = cdx_justification
+
     cves.append({
         "id": cve_id,
         # vex documents require a valid source, see https://github.com/DependencyTrack/dependency-track/issues/2977
         # this should always be NVD for yocto CVEs.
         "source": {"name": "NVD", "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}"},
-        "analysis": {
-            "state": vex_state,
-            "detail": detail_string,
-        },
+        "analysis": analysis,
         "affects": [{"ref": f"urn:cdx:{d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER')}/1#{bom_ref}"}]
     })
     return
